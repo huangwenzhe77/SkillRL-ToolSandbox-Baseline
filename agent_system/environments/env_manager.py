@@ -800,6 +800,82 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                 postprocess_text_obs.append(obs)
         return postprocess_text_obs
 
+
+class ToolSandboxEnvironmentManager(EnvironmentManagerBase):
+    """Environment manager for the stateful ToolSandbox protocol."""
+
+    def __init__(self, envs, projection_f, config):
+        super().__init__(envs, projection_f, config)
+        self.memory = SimpleMemory()
+
+    @staticmethod
+    def _scenario_goal(scenario):
+        return scenario.get("user_goal") or scenario.get("goal") or scenario.get("task") or scenario.get("user_utterance", "")
+
+    @staticmethod
+    def _render_observation(observation):
+        if isinstance(observation, str):
+            return observation
+        try:
+            import json
+            return json.dumps(observation, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            return str(observation)
+
+    def _build_text_obs(self, observations, init=False):
+        rendered = []
+        for i, observation in enumerate(observations):
+            scenario = self.envs.current_scenarios[i] or {}
+            tools = scenario.get("tools") or scenario.get("available_tools") or []
+            tool_text = self._render_observation(tools)
+            history = ""
+            if not init and self.config.env.history_length > 0:
+                recent = self.memory[i][-self.config.env.history_length:]
+                history = "\n".join(f"Action: {item['action']}\nResult: {item['observation']}" for item in recent)
+            rendered.append(
+                "You are an agent operating a stateful tool environment.\n"
+                f"User goal: {self._scenario_goal(scenario)}\n"
+                f"Available tools: {tool_text}\n"
+                f"Recent interaction:\n{history or '(none)'}\n"
+                f"Current observation: {self._render_observation(observation)}\n"
+                "Respond with exactly one JSON tool action, for example "
+                '{"type":"tool_call","name":"search_contacts","arguments":{}}; '
+                "or a final response object."
+            )
+        return rendered
+
+    def reset(self, kwargs=None):
+        observations, infos = self.envs.reset()
+        self.memory.reset(batch_size=len(observations))
+        return {"text": self._build_text_obs(observations, init=True), "image": None, "anchor": observations}, infos
+
+    def step(self, text_actions):
+        actions, valids = self.projection_f(text_actions)
+        observations, rewards, dones, infos = self.envs.step(actions)
+        self.memory.store({"action": actions, "observation": observations})
+        for i, info in enumerate(infos):
+            info["is_action_valid"] = to_numpy(valids[i])
+        return {"text": self._build_text_obs(observations), "image": None, "anchor": observations}, to_numpy(rewards), to_numpy(dones), infos
+
+    def success_evaluator(self, *args, **kwargs):
+        total_infos = kwargs["total_infos"]
+        total_batch_list = kwargs["total_batch_list"]
+        success = defaultdict(list)
+        for batch_idx, trajectory in enumerate(total_batch_list):
+            final_info = {}
+            for step_idx in reversed(range(len(trajectory))):
+                if trajectory[step_idx]["active_masks"]:
+                    final_info = total_infos[batch_idx][step_idx]
+                    break
+            won = float(bool(final_info.get("won", final_info.get("success", False))))
+            success["success_rate"].append(won)
+            success["minefield_violation_rate"].append(float(bool(final_info.get("minefield_violation", False))))
+            milestone_score = final_info.get("milestone_score", final_info.get("milestones_completed", won))
+            if isinstance(milestone_score, (list, tuple, set, dict)):
+                milestone_score = len(milestone_score)
+            success["milestone_score"].append(float(milestone_score))
+        return {key: np.asarray(value, dtype=np.float32) for key, value in success.items()}
+
 def make_envs(config):
     """
     Create enviroments 
@@ -810,7 +886,19 @@ def make_envs(config):
     group_n = config.env.rollout.n if config.env.rollout.n > 0 else 1
     resources_per_worker = OmegaConf.to_container(config.env.resources_per_worker, resolve=True)
 
-    if "search" in config.env.env_name.lower():
+    if "toolsandbox" in config.env.env_name.lower():
+        from agent_system.environments.env_package.toolsandbox import build_toolsandbox_envs, toolsandbox_projection
+        ts_cfg = config.env.toolsandbox
+        train_path = ts_cfg.get("train_path", ts_cfg.get("scenario_path", None))
+        val_path = ts_cfg.get("val_path", train_path)
+        backend_factory = ts_cfg.get("backend_factory", None)
+        if not train_path or not backend_factory:
+            raise ValueError("ToolSandbox requires env.toolsandbox.scenario_path and backend_factory")
+        _envs = build_toolsandbox_envs(train_path, backend_factory, seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, max_steps=config.env.max_steps)
+        _val_envs = build_toolsandbox_envs(val_path, backend_factory, seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, max_steps=config.env.max_steps)
+        projection_f = partial(toolsandbox_projection)
+        return ToolSandboxEnvironmentManager(_envs, projection_f, config), ToolSandboxEnvironmentManager(_val_envs, projection_f, config)
+    elif "search" in config.env.env_name.lower():
         from agent_system.environments.env_package.search import build_search_envs, search_projection
         _envs = build_search_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_config=config.env)
         _val_envs = build_search_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_config=config.env)
