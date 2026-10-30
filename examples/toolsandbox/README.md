@@ -49,8 +49,8 @@ Polars, Transformers, and related dependencies and does not target Python 3.14.
 # SkillRL environment
 pip install -e .
 
-# Official ToolSandbox package (Linux/macOS)
-pip install git+https://github.com/apple-aiml-research/ToolSandbox.git
+# Official ToolSandbox revision matching the included scenario manifest
+pip install git+https://github.com/apple-aiml-research/ToolSandbox.git@c8571d7854316d2e1c5f288e59fe1e34e53f6dd1
 ```
 
 On Windows run the same `pip install` from the activated SkillRL environment.
@@ -62,7 +62,27 @@ environment. Verify the scenario name against the installed revision:
 python -c "from tool_sandbox.scenarios import named_scenarios; from tool_sandbox.common.tool_discovery import ToolBackend; print(sorted(named_scenarios(ToolBackend.DEFAULT))[:20])"
 ```
 
-The included example is `scenarios/cellular_off.jsonl`. A server run can use:
+The official package defines its benchmark scenarios in Python instead of
+shipping a large standalone data archive. This repository includes
+`scenarios/official_all.jsonl`, a 253 KB manifest listing the 1,032 scenario
+names exposed by ToolSandbox commit `c8571d7854316d2e1c5f288e59fe1e34e53f6dd1`.
+The actual starting states, tools, and evaluation rules are loaded from the
+installed official package, so install ToolSandbox in the server environment
+as above.
+The count and names can change between ToolSandbox revisions. The small
+`scenarios/cellular_off.jsonl` file remains available for the smoke test.
+
+To try the complete manifest for both splits, generate the parquet index:
+
+```bash
+python examples/toolsandbox/prepare_dataset.py \
+  --train examples/toolsandbox/scenarios/official_all.jsonl \
+  --val examples/toolsandbox/scenarios/official_all.jsonl \
+  --output-dir /path/to/toolsandbox_data
+```
+
+This uses the same scenarios for train and validation as a convenience check;
+choose a deliberate split for a reported experiment. A server run can use:
 
 ```bash
 python -m verl.trainer.main_ppo \
