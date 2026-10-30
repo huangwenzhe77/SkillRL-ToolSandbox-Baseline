@@ -314,3 +314,8 @@ env:
   webshop:
     use_small: True
     human_goals: False
+  toolsandbox:
+    scenario_path: null
+    train_path: null
+    val_path: null
+    backend_factory: examples.toolsandbox.official_backend:make_backend

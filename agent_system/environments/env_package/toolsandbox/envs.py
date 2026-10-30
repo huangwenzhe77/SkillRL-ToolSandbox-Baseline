@@ -65,6 +65,7 @@ class ToolSandboxEnvs:
         self.backends = [None] * self.batch_size
         self.current_steps = np.zeros(self.batch_size, dtype=np.int32)
         self.current_scenarios = [None] * self.batch_size
+        self.current_infos = [None] * self.batch_size
 
     @staticmethod
     def _reset_backend(backend):
@@ -87,6 +88,7 @@ class ToolSandboxEnvs:
             observation, info = self._reset_backend(backend)
             info = dict(info or {})
             info.setdefault("scenario_id", scenario.get("id", str(index)))
+            self.current_infos[slot] = info
             observations.append(observation)
             infos.append(info)
         return observations, infos
@@ -108,10 +110,16 @@ class ToolSandboxEnvs:
                 info = {}
             else:
                 raise ValueError("ToolSandbox backend step must return 3 or 4 values")
-            done = bool(done or self.current_steps[slot] >= self.max_steps)
             info = dict(info or {})
+            reached_limit = self.current_steps[slot] >= self.max_steps and not done
+            if reached_limit and hasattr(backend, "finalize"):
+                info.update(dict(backend.finalize() or {}))
+            done = bool(done or reached_limit)
             info.setdefault("won", bool(info.get("success", False) and done))
-            info.setdefault("tool_calling", int(action.get("type") == "tool_call" or "name" in action))
+            is_tool_call = isinstance(action, dict) and (
+                action.get("type") == "tool_call" or bool(action.get("name"))
+            )
+            info.setdefault("tool_calling", int(is_tool_call))
             results.append((observation, float(reward), done, info))
         return tuple(map(list, zip(*results)))
 

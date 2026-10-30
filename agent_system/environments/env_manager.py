@@ -807,6 +807,8 @@ class ToolSandboxEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         super().__init__(envs, projection_f, config)
         self.memory = SimpleMemory()
+        self.available_tools = [[] for _ in range(getattr(envs, "batch_size", 0))]
+        self.scenario_goals = ["" for _ in range(getattr(envs, "batch_size", 0))]
 
     @staticmethod
     def _scenario_goal(scenario):
@@ -826,7 +828,8 @@ class ToolSandboxEnvironmentManager(EnvironmentManagerBase):
         rendered = []
         for i, observation in enumerate(observations):
             scenario = self.envs.current_scenarios[i] or {}
-            tools = scenario.get("tools") or scenario.get("available_tools") or []
+            tools = self.available_tools[i] or scenario.get("tools") or scenario.get("available_tools") or []
+            goal = self.scenario_goals[i] or self._scenario_goal(scenario)
             tool_text = self._render_observation(tools)
             history = ""
             if not init and self.config.env.history_length > 0:
@@ -834,7 +837,7 @@ class ToolSandboxEnvironmentManager(EnvironmentManagerBase):
                 history = "\n".join(f"Action: {item['action']}\nResult: {item['observation']}" for item in recent)
             rendered.append(
                 "You are an agent operating a stateful tool environment.\n"
-                f"User goal: {self._scenario_goal(scenario)}\n"
+                f"User goal: {goal}\n"
                 f"Available tools: {tool_text}\n"
                 f"Recent interaction:\n{history or '(none)'}\n"
                 f"Current observation: {self._render_observation(observation)}\n"
@@ -847,6 +850,14 @@ class ToolSandboxEnvironmentManager(EnvironmentManagerBase):
     def reset(self, kwargs=None):
         observations, infos = self.envs.reset()
         self.memory.reset(batch_size=len(observations))
+        self.available_tools = [
+            info.get("tool_schemas") or list(info.get("available_tools", []))
+            for info in infos
+        ]
+        self.scenario_goals = [
+            info.get("user_goal") or self._scenario_goal(self.envs.current_scenarios[i] or {})
+            for i, info in enumerate(infos)
+        ]
         return {"text": self._build_text_obs(observations, init=True), "image": None, "anchor": observations}, infos
 
     def step(self, text_actions):
@@ -889,13 +900,25 @@ def make_envs(config):
     if "toolsandbox" in config.env.env_name.lower():
         from agent_system.environments.env_package.toolsandbox import build_toolsandbox_envs, toolsandbox_projection
         ts_cfg = config.env.toolsandbox
-        train_path = ts_cfg.get("train_path", ts_cfg.get("scenario_path", None))
-        val_path = ts_cfg.get("val_path", train_path)
+        # OmegaConf keeps explicitly declared null fields, so ``get`` does not
+        # fall back from a null ``train_path``/``val_path``.  Accept the short
+        # ``scenario_path`` form while still allowing separate train/validation
+        # files.
+        train_path = ts_cfg.get("train_path") or ts_cfg.get("scenario_path")
+        val_path = ts_cfg.get("val_path") or train_path
         backend_factory = ts_cfg.get("backend_factory", None)
         if not train_path or not backend_factory:
-            raise ValueError("ToolSandbox requires env.toolsandbox.scenario_path and backend_factory")
-        _envs = build_toolsandbox_envs(train_path, backend_factory, seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, max_steps=config.env.max_steps)
-        _val_envs = build_toolsandbox_envs(val_path, backend_factory, seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, max_steps=config.env.max_steps)
+            raise ValueError(
+                "ToolSandbox requires env.toolsandbox.train_path or scenario_path, "
+                "and backend_factory"
+            )
+        train_batch_size = int(config.data.train_batch_size)
+        # The base config leaves validation batch size null.  Keep validation
+        # usable for ToolSandbox runs by reusing the training size unless an
+        # explicit value is supplied.
+        val_batch_size = int(config.data.val_batch_size or train_batch_size)
+        _envs = build_toolsandbox_envs(train_path, backend_factory, seed=config.env.seed, env_num=train_batch_size, group_n=group_n, is_train=True, max_steps=config.env.max_steps)
+        _val_envs = build_toolsandbox_envs(val_path, backend_factory, seed=config.env.seed + 1000, env_num=val_batch_size, group_n=1, is_train=False, max_steps=config.env.max_steps)
         projection_f = partial(toolsandbox_projection)
         return ToolSandboxEnvironmentManager(_envs, projection_f, config), ToolSandboxEnvironmentManager(_val_envs, projection_f, config)
     elif "search" in config.env.env_name.lower():
